@@ -180,7 +180,11 @@ class CP:
             sys.exit("Client Portal Gateway isn't running on this machine. Start it (see README) and log in at "
                      "https://localhost:5055.")
         if not (st or {}).get("authenticated"):
-            self.post("/iserver/reauthenticate")
+            # Logged in but no brokerage session yet: initialize one (IBKR Web API docs, troubleshooting → 401).
+            try:
+                self.post("/iserver/auth/ssodh/init", {"publish": True, "compete": True})
+            except requests.exceptions.HTTPError:
+                self.post("/iserver/reauthenticate")
             time.sleep(3)
             st = self.post("/iserver/auth/status")
         if not (st or {}).get("authenticated"):
