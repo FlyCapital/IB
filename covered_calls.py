@@ -195,6 +195,13 @@ class CP:
 
     # data
     def positions(self, acct):
+        # The portfolio endpoint is cached and can miss calls sold minutes ago (which would double-write them),
+        # so invalidate the cache first.
+        try:
+            self.post(f"/portfolio/{acct}/positions/invalidate")
+            time.sleep(1)
+        except requests.exceptions.HTTPError:
+            pass
         out, page = [], 0
         while True:
             rows = self.get(f"/portfolio/{acct}/positions/{page}") or []
@@ -203,10 +210,22 @@ class CP:
                 return out
             page += 1
 
-    def open_orders(self):
-        self.get("/iserver/account/orders", force="true")            # first call primes the cache
-        time.sleep(1)
-        return (self.get("/iserver/account/orders") or {}).get("orders", [])
+    def open_orders(self, accounts=()):
+        """Working orders. With several accounts under one login the gateway only lists the SELECTED account's
+        orders, so switch to each account in turn (POST /iserver/account) and collect them all."""
+        out = []
+        for acct in (accounts or [None]):
+            if acct:
+                try:
+                    self.post("/iserver/account", {"acctId": acct})
+                except requests.exceptions.HTTPError:
+                    pass
+            self.get("/iserver/account/orders", force="true")        # first call primes the cache
+            time.sleep(1)
+            for o in (self.get("/iserver/account/orders") or {}).get("orders", []):
+                o.setdefault("acct", acct)
+                out.append(o)
+        return out
 
     def stock_conid(self, symbol):
         res = self.get("/iserver/secdef/search", symbol=symbol, secType="STK") or []
@@ -234,6 +253,10 @@ class CP:
     def option_contracts(self, conid, month, strike):
         return self.get("/iserver/secdef/info", conid=conid, sectype="OPT", month=month,
                         strike=strike, right="C") or []
+
+    def whatif(self, acct, order):
+        """IBKR's pre-trade check: margin impact and any rejection reason, without placing. -> dict."""
+        return self.post(f"/iserver/account/{acct}/orders/whatif", {"orders": [order]}) or {}
 
     def place(self, acct, order):
         """Submit one order and answer the gateway's confirmation prompts (logged). -> final response."""
@@ -351,6 +374,8 @@ def main():
     ap.add_argument("--dte-target", type=int, default=DTE_TARGET)
     ap.add_argument("--above-cost", action="store_true", help="never pick a strike below your average cost")
     ap.add_argument("--merrill-csv", help="plan-only for Merrill holdings from its Positions CSV export")
+    ap.add_argument("--merrill-into", default="", help="with --merrill-csv --live: sell those calls in THIS IB account "
+                    "instead. IB doesn't hold the shares, so they are NAKED calls (needs naked-option approval)")
     ap.add_argument("--live", action="store_true", help="place the orders (asks you to type YES)")
     a = ap.parse_args()
     only = {s.strip().upper() for s in a.symbols.split(",") if s.strip()}
@@ -366,12 +391,15 @@ def main():
         hold = {("MERRILL", s): dict(shares=q, avg_cost=None, short_calls=0)
                 for s, q in read_merrill_csv(a.merrill_csv).items()}
         busy = set()
-        if a.live:
-            log("--live ignored for Merrill: no trading API, this is a plan to enter by hand")
+        if a.live and not a.merrill_into:
+            log("--live ignored for Merrill: no trading API, this is a plan to enter by hand "
+                "(or pass --merrill-into <IB account> to sell them in IB as NAKED calls)")
             a.live = False
+        if a.merrill_into:
+            hold = {(a.merrill_into, s): h for (_, s), h in hold.items()}
     else:
         hold = holdings(cp, accts)
-        busy = working_call_sells(cp.open_orders())
+        busy = working_call_sells(cp.open_orders(accts))
 
     plans, skipped = [], []
     for (acct, sym), h in sorted(hold.items()):
@@ -438,12 +466,25 @@ def main():
         if not a.merrill_csv:
             print("\nDRY RUN — nothing sent. Re-run with --live to place these orders.")
         return
-    if input("\nPlace these SELL-to-open call orders now? Type YES: ").strip() != "YES":
+    naked = bool(a.merrill_csv and a.merrill_into)
+    word = "NAKED" if naked else "YES"
+    if naked:
+        print("\n*** These calls are NAKED: the shares are at Merrill, not in IB. Loss is unlimited if the stock "
+              "rallies through the strike, and IB will margin them as uncovered. ***")
+    if input(f"\nPlace these SELL-to-open call orders now? Type {word}: ").strip() != word:
         sys.exit("aborted")
     for p in plans:
         order = dict(conid=p["conid"], orderType="LMT", price=p["limit"], side="SELL", quantity=p["contracts"],
                      tif="DAY", cOID=f"cc-{p['symbol']}-{uuid.uuid4().hex[:8]}")
         try:
+            w = cp.whatif(p["account"], order)
+            err = (w.get("error") or "").strip()
+            log(f"{p['account']} {p['symbol']} what-if: initial margin change "
+                f"{(w.get('initial') or {}).get('change')}, maintenance change {(w.get('maintenance') or {}).get('change')}"
+                f"{' | warning: ' + w['warn'] if w.get('warn') else ''}{' | ERROR: ' + err if err else ''}")
+            if err:
+                log(f"{p['account']} {p['symbol']} SKIPPED: IBKR would reject it ({err})")
+                continue
             r = cp.place(p["account"], order)
             log(f"{p['account']} SELL {p['contracts']} {p['symbol']} {p['expiry']} {p['strike']:g}C @ {p['limit']}: {r}")
         except Exception as e:
