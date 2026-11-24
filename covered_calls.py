@@ -283,16 +283,22 @@ def plan_symbol(cp, symbol, avg_cost, a):
         return dict(skip="no stock price (market data subscription?)")
     today = date.today()
     months = months_in_window(today, a.dte_min, a.dte_max)
-    # listed expiries in the window: ask secdef/info for one near-the-money strike per month
+    # listed expiries in the window: secdef/info only returns expiries where the probed strike exists, and
+    # weeklies list fewer strikes, so probe a few round strikes near the money and union what comes back
     exps = {}
     for m in months:
         ks = cp.strikes(conid, m)
         if not ks:
             continue
-        k_atm = min(ks, key=lambda k: abs(k - spot * (1 + a.min_otm)))
-        for c in cp.option_contracts(conid, m, k_atm):
-            if c.get("maturityDate"):
-                exps[c["maturityDate"]] = (m, ks)
+        probes = {min(ks, key=lambda k: abs(k - x)) for x in (spot, spot * (1 + a.min_otm))}
+        for step in (5, 10):
+            rounded = [k for k in ks if abs(k / step - round(k / step)) < 1e-9]
+            if rounded:
+                probes.add(min(rounded, key=lambda k: abs(k - spot)))
+        for k in sorted(probes):
+            for c in cp.option_contracts(conid, m, k):
+                if c.get("maturityDate"):
+                    exps[c["maturityDate"]] = (m, ks)
     pick = pick_expiry(exps, today, a.dte_min, a.dte_max, a.dte_target)
     if not pick:
         return dict(skip=f"no expiry {a.dte_min}-{a.dte_max}d out")
@@ -352,7 +358,7 @@ def main():
 
     cp = CP(a.gateway)
     acc = cp.ensure_session()
-    all_accts = (acc or {}).get("accounts", [])
+    all_accts = [x for x in (acc or {}).get("accounts", []) if x != "All"]   # "All" = IBKR's aggregate pseudo-account
     accts = [x for x in all_accts if not a.accounts or x in a.accounts.split(",")]
     log(f"logged in; accounts: {all_accts}")
 
