@@ -393,7 +393,26 @@ def main():
         print(f"{p['account']:<11}{p['symbol']:<7}{p['shares']:>8g}{p['contracts']:>5}  {p['expiry']:<9}{p['dte']:>4}"
               f"{p['strike']:>9g}{p['otm_pct']:>6}{p['delta']:>7}{p['bid']:>7}{p['ask']:>7}{p['limit']:>7}"
               f"{p['premium']:>10,.2f}{p['yield_ann_pct']:>6}")
-    print(f"\n{len(plans)} orders, total premium ≈ ${sum(p['premium'] for p in plans):,.2f}")
+    # Premium summary: at the limit (mid) and, conservatively, at the bid; plus the stock value it's written on.
+    print(f"\nPREMIUM YOU CAN COLLECT ({len(plans)} orders)")
+    print(f"{'account':<11}{'orders':>7}{'contracts':>10}{'at limit (mid)':>16}{'at bid':>12}{'stock covered':>16}{'% of stock':>11}")
+    by = {}
+    for p in plans:
+        b = by.setdefault(p["account"], dict(n=0, c=0, mid=0.0, bid=0.0, val=0.0))
+        b["n"] += 1; b["c"] += p["contracts"]; b["mid"] += p["premium"]
+        b["bid"] += p["contracts"] * 100 * p["bid"]; b["val"] += p["contracts"] * 100 * p["spot"]
+    tot = dict(n=0, c=0, mid=0.0, bid=0.0, val=0.0)
+    for acct, b in sorted(by.items()):
+        for k in tot: tot[k] += b[k]
+        print(f"{acct:<11}{b['n']:>7}{b['c']:>10}{b['mid']:>16,.2f}{b['bid']:>12,.2f}{b['val']:>16,.0f}"
+              f"{100 * b['mid'] / b['val']:>10.2f}%")
+    if len(by) > 1:
+        print(f"{'TOTAL':<11}{tot['n']:>7}{tot['c']:>10}{tot['mid']:>16,.2f}{tot['bid']:>12,.2f}{tot['val']:>16,.0f}"
+              f"{100 * tot['mid'] / tot['val']:>10.2f}%")
+    if plans:
+        avg_dte = sum(p["dte"] for p in plans) / len(plans)
+        print(f"≈ {100 * tot['mid'] / tot['val']:.2f}% of the covered stock value over ~{avg_dte:.0f} days "
+              f"(≈ {100 * tot['mid'] / tot['val'] * 365 / avg_dte:.1f}%/yr if repeated)")
     for acct, sym, why in skipped:
         print(f"  skipped {acct} {sym}: {why}")
 
